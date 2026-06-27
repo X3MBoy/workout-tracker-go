@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"workout-tracker-go/db"
+	"workout-tracker-go/exporter"
 	"workout-tracker-go/parser"
 )
 
@@ -79,4 +80,11 @@ func main() {
 		}
 	}
 	fmt.Println("\n🚀 Historic migration complete! Core relational data and cardio metrics are fully synchronized.")
+	jsonOutputPath := "ia_training_context.json"
+	err = exporter.ExportToIAJson(database, jsonOutputPath)
+	if err != nil {
+		log.Fatalf("❌ Error generando el JSON para la IA: %v", err)
+	}
+
+	log.Printf("✨ ¡Todo listo! Archivo optimizado generado en: %s\n", jsonOutputPath)
 }

@@ -1,142 +1,134 @@
-package main
+package exporter
 
 import (
 	"database/sql"
 	"encoding/json"
-	"fmt"
 	"os"
 )
 
-type IACoachContext struct {
-	UserMetadata   *UserMetadataExport `json:"user_metadata"`
-	HistorySummary []SessionExport     `json:"history_summary"`
+type IASession struct {
+	Date     string       `json:"date"`
+	Cardio   *IACardio    `json:"cardio,omitempty"`
+	Workouts []IAWorkout  `json:"workouts,omitempty"`
 }
-
-type UserMetadataExport struct {
-	BirthDate       string  `json:"birth_date"`
-	Gender          string  `json:"gender"`
-	HeightM         float64 `json:"height_m"`
-	InitialWeightKg float64 `json:"initial_weight_kg"`
-	CurrentWeightKg float64 `json:"current_weight_kg"`
-	LastWeightDate  string  `json:"last_weight_date"`
-	HealthContext   string  `json:"health_and_objectives_context"`
+type IACardio struct {
+	Duration float64 `json:"duration_min"`
+	Distance float64 `json:"distance_km"`
+	AvgSpeed float64 `json:"avg_speed_kmh"`
+	MaxSpeed float64 `json:"max_speed_kmh"`
+	Calories float64 `json:"calories_kcal"`
+	MaxHR    int     `json:"max_hr_bpm"`
 }
-
-type SessionExport struct {
-	Date     string        `json:"date"`
-	Comments string        `json:"comments,omitempty"`
-	Cardio   *CardioData   `json:"cardio,omitempty"`
-	Workouts []WorkoutData `json:"workouts,omitempty"`
-}
-
-type CardioData struct {
-	DurationMin float64 `json:"duration_minutes"`
-	DistanceKm  float64 `json:"distance_km"`
-	AvgSpeed    float64 `json:"avg_speed,omitempty"`
-	MaxSpeed    float64 `json:"max_speed,omitempty"`
-	Calories    float64 `json:"calories,omitempty"`
-	MaxHR       int     `json:"max_heart_rate,omitempty"`
-}
-
-type WorkoutData struct {
+type IAWorkout struct {
 	Exercise string   `json:"exercise"`
-	Series   []string `json:"series"`
+	Series   []IASet  `json:"series"`
+}
+type IASet struct {
+	SetIndex int     `json:"set"`
+	Reps     int     `json:"reps"`
+	Weight   float64 `json:"weight_kg"`
+}
+type IAUserData struct {
+	Birthdate     string  `json:"birthdate"`
+	Gender        string  `json:"gender"`
+	Height        float64 `json:"height_m"`
+	InitialWeight float64 `json:"initial_weight_kg"`
+	CurrentWeight float64 `json:"current_weight_kg"`
+	WeightDate    string  `json:"weight_date"`
+	HealthContext string  `json:"health_context"`
+}
+type IAExportPayload struct {
+	User    IAUserData  `json:"user_metadata"`
+	History []IASession `json:"training_history"`
 }
 
-func ExportToIAJson(dbConn *sql.DB, outputPath string) error {
-	contextPayload := IACoachContext{}
-	var meta UserMetadataExport
-	metaQuery := `
-		SELECT birth_date, gender, height_m, initial_weight_kg, current_weight_kg, last_weight_date, health_context 
-		FROM user_metadata 
-		LIMIT 1`
-
-	err := dbConn.QueryRow(metaQuery).Scan(
-		&meta.BirthDate, &meta.Gender, &meta.HeightM,
-		&meta.InitialWeightKg, &meta.CurrentWeightKg, &meta.LastWeightDate,
-		&meta.HealthContext,
+func ExportToIAJson(db *sql.DB, outputPath string) error {
+	payload := IAExportPayload{
+		History: []IASession{},
+	}
+	userQuery := `SELECT birth_date, gender, height_m, initial_weight_kg, current_weight_kg, last_weight_date, health_context 
+	              FROM user_metadata ORDER BY id DESC LIMIT 1`
+	err := db.QueryRow(userQuery).Scan(
+		&payload.User.Birthdate, &payload.User.Gender, &payload.User.Height,
+		&payload.User.InitialWeight, &payload.User.CurrentWeight, &payload.User.WeightDate,
+		&payload.User.HealthContext,
 	)
 	if err != nil && err != sql.ErrNoRows {
-		return fmt.Errorf("error querying user metadata: %w", err)
+		return err
 	}
-	if err == nil {
-		contextPayload.UserMetadata = &meta
-	}
-	sessionQuery := `
-		SELECT s.id, s.date_of_exercise, s.comments,
-				c.duration_minutes, c.distance_km, c.avg_speed, c.max_speed, c.calories, c.max_heart_rate
-		FROM sessions s
-		LEFT JOIN cardio_sessions c ON s.id = c.session_id
-		ORDER BY s.date_of_exercise ASC`
-	rows, err := dbConn.Query(sessionQuery)
+	sessionRows, err := db.Query(`SELECT id, date_of_exercise FROM sessions ORDER BY date_of_exercise ASC`)
 	if err != nil {
-		return fmt.Errorf("error querying sessions: %w", err)
+		return err
 	}
-	defer rows.Close()
-	for rows.Next() {
-		var sID int64
+	defer sessionRows.Close()
+	for sessionRows.Next() {
+		var sID int
 		var sDate string
-		var sComments sql.NullString
-		var cDur, cDist, cAvgS, cMaxS, cCal sql.NullFloat64
-		var cHR sql.NullInt64
-		err := rows.Scan(&sID, &sDate, &sComments, &cDur, &cDist, &cAvgS, &cMaxS, &cCal, &cHR)
-		if err != nil {
-			return fmt.Errorf("error scanning session row: %w", err)
+		if err := sessionRows.Scan(&sID, &sDate); err != nil {
+			return err
 		}
-		session := SessionExport{Date: sDate}
-		if sComments.Valid && sComments.String != "" {
-			session.Comments = sComments.String
-		}
-		if cDur.Valid && cDur.Float64 > 0 {
-			session.Cardio = &CardioData{
-				DurationMin: cDur.Float64,
-				DistanceKm:  cDist.Float64,
-				AvgSpeed:    cAvgS.Float64,
-				MaxSpeed:    cMaxS.Float64,
-				Calories:    cCal.Float64,
-				MaxHR:       int(cHR.Int64),
-			}
-		}
-		workoutQuery := `
-			SELECT e.name, ser.series_number, ser.reps, ser.weight, ser.rpe
-			FROM series ser
-			JOIN exercises e ON ser.exercise_id = e.id
-			WHERE ser.session_id = ?
-			ORDER BY ser.exercise_id, ser.series_number ASC`
-		wRows, err := dbConn.Query(workoutQuery, sID)
+		sessionObj := IASession{Date: sDate}
+		cardioQuery := `SELECT duration_minutes, distance_km, avg_speed, max_speed, calories, max_heart_rate 
+		                FROM cardio_sessions WHERE session_id = ?`
+		var cDur, cDist, cAvgS, cMaxS, cCal float64
+		var cMaxHR sql.NullInt32
+		err = db.QueryRow(cardioQuery, sID).Scan(&cDur, &cDist, &cAvgS, &cMaxS, &cCal, &cMaxHR)
 		if err == nil {
-			exerciseMap := make(map[string][]string)
-			var orderedExercises []string
-			for wRows.Next() {
-				var exName string
-				var serNum, reps int
-				var weight float64
-				var rpe sql.NullInt64
-				if err := wRows.Scan(&exName, &serNum, &reps, &weight, &rpe); err == nil {
-					serStr := fmt.Sprintf("%dx%dx%.1f", serNum, reps, weight)
-					if rpe.Valid && rpe.Int64 > 0 {
-						serStr = fmt.Sprintf("%s (RPE %d)", serStr, rpe.Int64)
-					}
-					if _, exists := exerciseMap[exName]; !exists {
-						orderedExercises = append(orderedExercises, exName)
-					}
-					exerciseMap[exName] = append(exerciseMap[exName], serStr)
-				}
+			sessionObj.Cardio = &IACardio{
+				Duration: cDur, Distance: cDist, AvgSpeed: cAvgS,
+				MaxSpeed: cMaxS, Calories: cCal, MaxHR: int(cMaxHR.Int32),
 			}
-			wRows.Close()
-			for _, name := range orderedExercises {
-				session.Workouts = append(session.Workouts, WorkoutData{
-					Exercise: name,
-					Series:   exerciseMap[name],
+		}
+		workoutRows, err := db.Query(`
+			SELECT DISTINCT e.id, e.name 
+			FROM series s
+			JOIN exercises e ON s.exercise_id = e.id
+			WHERE s.session_id = ?`, sID)
+		if err != nil {
+			return err
+		}
+		for workoutRows.Next() {
+			var eID int
+			var eName string
+			if err := workoutRows.Scan(&eID, &eName); err != nil {
+				workoutRows.Close()
+				return err
+			}
+			workoutObj := IAWorkout{Exercise: eName, Series: []IASet{}}
+			setRows, err := db.Query(`
+				SELECT series_number, reps, weight 
+				FROM series 
+				WHERE session_id = ? AND exercise_id = ? 
+				ORDER BY series_number ASC`, sID, eID)
+			if err != nil {
+				workoutRows.Close()
+				return err
+			}
+			for setRows.Next() {
+				var sIdx, sReps int
+				var sWgt float64
+				if err := setRows.Scan(&sIdx, &sReps, &sWgt); err != nil {
+					setRows.Close()
+					workoutRows.Close()
+					return err
+				}
+				workoutObj.Series = append(workoutObj.Series, IASet{
+					SetIndex: sIdx,
+					Reps:     sReps,
+					Weight:   sWgt,
 				})
 			}
+			setRows.Close()
+			if len(workoutObj.Series) > 0 {
+				sessionObj.Workouts = append(sessionObj.Workouts, workoutObj)
+			}
 		}
-		contextPayload.HistorySummary = append(contextPayload.HistorySummary, session)
+		workoutRows.Close()
+		payload.History = append(payload.History, sessionObj)
 	}
-	jsonBytes, err := json.MarshalIndent(contextPayload, "", "  ")
+	jsonData, err := json.MarshalIndent(payload, "", "  ")
 	if err != nil {
-		return fmt.Errorf("error marshaling context JSON: %w", err)
+		return err
 	}
-	fmt.Printf("🚀 Generating optimized AI dataset file from SQLite at: %s\n", outputPath)
-	return os.WriteFile(outputPath, jsonBytes, 0644)
+	return os.WriteFile(outputPath, jsonData, 0644)
 }
